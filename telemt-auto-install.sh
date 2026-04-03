@@ -7,6 +7,7 @@ set -Eeuo pipefail
 # =========================================================
 
 CANDIDATE_PORTS=(1443 2443 3443 4443 5443 6443 7443 8443 9443)
+API_CANDIDATE_PORTS=(9091 19091 29091 39091 49091)
 
 TELEMT_USER="${TELEMT_USER:-telemt}"
 TELEMT_GROUP="${TELEMT_GROUP:-telemt}"
@@ -15,18 +16,12 @@ TELEMT_CONFIG_DIR="${TELEMT_CONFIG_DIR:-/etc/telemt}"
 TELEMT_CONFIG_FILE="${TELEMT_CONFIG_FILE:-/etc/telemt/telemt.toml}"
 TELEMT_BIN="${TELEMT_BIN:-/bin/telemt}"
 TELEMT_SERVICE="${TELEMT_SERVICE:-/etc/systemd/system/telemt.service}"
-API_LISTEN="${API_LISTEN:-127.0.0.1:9091}"
 
-# Формат:
-# TELEMT_USERS="user1:0123456789abcdef0123456789abcdef,user2:abcdefabcdefabcdefabcdefabcdefab"
 TELEMT_USERS="${TELEMT_USERS:-}"
-
-# Опционально, 32 hex chars
 AD_TAG="${AD_TAG:-}"
-
-# Если нужен свой порт вручную:
-# TELEMT_PORT=8443 ./telemt-auto-install.sh
 TELEMT_PORT="${TELEMT_PORT:-}"
+API_LISTEN="${API_LISTEN:-}"
+TLS_DOMAIN="${TLS_DOMAIN:-}"
 
 log()  { echo -e "\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
@@ -108,19 +103,51 @@ choose_port() {
   for p in "${CANDIDATE_PORTS[@]}"; do
     if is_port_free "$p"; then
       TELEMT_PORT="$p"
-      log "Найден свободный порт: ${TELEMT_PORT}"
+      log "Найден свободный proxy-порт: ${TELEMT_PORT}"
       return 0
     fi
   done
 
-  err "Свободных портов не найдено в списке: ${CANDIDATE_PORTS[*]}"
+  err "Свободных proxy-портов не найдено в списке: ${CANDIDATE_PORTS[*]}"
+  exit 1
+}
+
+choose_api_listen() {
+  local p api_port
+
+  if [[ -n "${API_LISTEN}" ]]; then
+    api_port="${API_LISTEN##*:}"
+    if is_port_free "${api_port}"; then
+      log "Использую API_LISTEN из env: ${API_LISTEN}"
+      return 0
+    else
+      err "API порт ${api_port} занят"
+      ss -ltnup | grep -E "[:.]${api_port}[[:space:]]" || true
+      exit 1
+    fi
+  fi
+
+  for p in "${API_CANDIDATE_PORTS[@]}"; do
+    if is_port_free "$p"; then
+      API_LISTEN="127.0.0.1:${p}"
+      log "Найден свободный API-порт: ${API_LISTEN}"
+      return 0
+    fi
+  done
+
+  err "Свободных API-портов не найдено в списке: ${API_CANDIDATE_PORTS[*]}"
   exit 1
 }
 
 ask_tls_domain() {
   local input=""
+  if [[ -n "${TLS_DOMAIN}" ]]; then
+    log "Использую TLS_DOMAIN из env: ${TLS_DOMAIN}"
+    return 0
+  fi
+
   while true; do
-    read -r -p "Введи сайт для маскировки (например cloudflare.com): " input
+    read -r -p "Введи сайт для маскировки (например github.com): " input
     input="$(trim "$input")"
 
     if [[ -z "$input" ]]; then
@@ -128,7 +155,6 @@ ask_tls_domain() {
       continue
     fi
 
-    # Очень базовая проверка
     if [[ "$input" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
       TLS_DOMAIN="$input"
       log "Использую tls_domain: ${TLS_DOMAIN}"
@@ -200,7 +226,7 @@ build_users_toml() {
 
   if [[ -z "${users_raw}" ]]; then
     generated_secret="$(random_hex_32chars)"
-    output+="hello = \"${generated_secret}\""$'\n'
+    output+="\"hello\" = \"${generated_secret}\""$'\n'
     echo "${output}"
     return 0
   fi
@@ -335,8 +361,6 @@ open_firewall_port() {
       iptables -I INPUT -p tcp --dport "${port}" -j ACCEPT || warn "Не удалось добавить правило iptables"
       if command_exists netfilter-persistent; then
         netfilter-persistent save >/dev/null 2>&1 || true
-      elif [[ -x /usr/sbin/service ]]; then
-        service iptables save >/dev/null 2>&1 || true
       fi
     fi
     return 0
@@ -356,6 +380,66 @@ wait_for_api() {
   return 1
 }
 
+get_external_ipv4() {
+  local ip=""
+  ip="$(curl -4 -fsS --max-time 5 ifconfig.me 2>/dev/null || true)"
+  ip="$(trim "$ip")"
+
+  if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    printf '%s' "$ip"
+    return 0
+  fi
+
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  ip="$(trim "$ip")"
+  if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    printf '%s' "$ip"
+    return 0
+  fi
+
+  return 1
+}
+
+show_links() {
+  local external_ip=""
+  local json=""
+  local secrets=()
+  local tls_links=()
+  local i
+
+  log "Получаю ссылки пользователей из API"
+
+  if ! wait_for_api; then
+    warn "API не успел подняться"
+    warn "Проверь позже командой: curl -s http://${API_LISTEN}/v1/users | jq"
+    return 0
+  fi
+
+  json="$(curl -fsS "http://${API_LISTEN}/v1/users")"
+  echo "${json}" | jq .
+
+  external_ip="$(get_external_ipv4 || true)"
+  if [[ -z "${external_ip}" ]]; then
+    warn "Не удалось определить внешний IPv4 автоматически"
+    return 0
+  fi
+
+  mapfile -t secrets < <(echo "${json}" | jq -r '.data[].links.tls[]? | capture("secret=(?<s>[^&]+)").s')
+  mapfile -t tls_links < <(echo "${json}" | jq -r '.data[].username')
+
+  if [[ "${#secrets[@]}" -eq 0 ]]; then
+    warn "Не нашёл TLS secret в API-ответе"
+    return 0
+  fi
+
+  echo
+  log "Готовые клиентские ссылки с внешним IPv4:"
+  for i in "${!secrets[@]}"; do
+    echo "user[$((i+1))]: tg://proxy?server=${external_ip}&port=${TELEMT_PORT}&secret=${secrets[$i]}"
+    echo "user[$((i+1))]: https://t.me/proxy?server=${external_ip}&port=${TELEMT_PORT}&secret=${secrets[$i]}"
+  done
+}
+
 start_service() {
   log "Включаю и запускаю telemt"
   systemctl enable telemt >/dev/null 2>&1
@@ -373,18 +457,6 @@ start_service() {
   systemctl status telemt --no-pager -l || true
 }
 
-show_links() {
-  log "Получаю ссылки пользователей из API"
-
-  if wait_for_api; then
-    curl -fsS "http://${API_LISTEN}/v1/users" | jq .
-  else
-    warn "API не успел подняться"
-    warn "Проверь позже командой:"
-    echo "  curl -s http://${API_LISTEN}/v1/users | jq"
-  fi
-}
-
 print_summary() {
   cat <<EOF
 
@@ -394,9 +466,9 @@ Telemt установлен
 Бинарь:      ${TELEMT_BIN}
 Конфиг:      ${TELEMT_CONFIG_FILE}
 Сервис:      telemt
-Порт:        ${TELEMT_PORT}
+Proxy port:  ${TELEMT_PORT}
+API listen:  ${API_LISTEN}
 TLS domain:  ${TLS_DOMAIN}
-API:         http://${API_LISTEN}/v1/users
 
 Полезные команды:
   systemctl status telemt
@@ -416,6 +488,7 @@ EOF
 main() {
   require_root
   choose_port
+  choose_api_listen
   ask_tls_domain
   install_packages
   download_telemt
